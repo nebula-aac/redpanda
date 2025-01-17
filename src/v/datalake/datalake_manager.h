@@ -16,6 +16,7 @@
 #include "config/property.h"
 #include "container/chunked_hash_map.h"
 #include "datalake/fwd.h"
+#include "datalake/record_schema_resolver.h"
 #include "datalake/translation/partition_translator.h"
 #include "features/fwd.h"
 #include "pandaproxy/schema_registry/fwd.h"
@@ -75,7 +76,7 @@ private:
     void on_group_notification(const model::ntp&);
     void start_translator(
       ss::lw_shared_ptr<cluster::partition>, model::iceberg_mode);
-    ss::future<> stop_translator(const model::ntp&);
+    void stop_translator(const model::ntp&);
 
     model::node_id _self;
     ss::sharded<raft::group_manager>* _group_mgr;
@@ -92,6 +93,7 @@ private:
     std::unique_ptr<iceberg::catalog> _catalog;
     std::unique_ptr<datalake::schema_manager> _schema_mgr;
     std::unique_ptr<datalake::type_resolver> _type_resolver;
+    std::unique_ptr<datalake::schema_cache> _schema_cache;
     ss::sharded<ss::abort_source>* _as;
     ss::scheduling_group _sg;
     ss::gate _gate;

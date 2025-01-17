@@ -15,6 +15,7 @@
 #include "datalake/partitioning_writer.h"
 #include "datalake/schema_identifier.h"
 #include "model/record.h"
+#include "utils/lazy_abort_source.h"
 #include "utils/prefix_logger.h"
 
 #include <seastar/core/future.hh>
@@ -38,7 +39,7 @@ public:
         kafka::offset last_offset;
         // vector containing a list of files that were written during
         // translation.
-        chunked_vector<local_file_metadata> data_files;
+        chunked_vector<partitioning_writer::partitioned_file> data_files;
     };
     explicit record_multiplexer(
       const model::ntp& ntp,
@@ -47,7 +48,8 @@ public:
       schema_manager& schema_mgr,
       type_resolver& type_resolver,
       record_translator& record_translator,
-      table_creator&);
+      table_creator&,
+      lazy_abort_source& as);
 
     ss::future<ss::stop_iteration> operator()(model::record_batch batch);
     ss::future<result<write_result, writer_error>> end_of_stream();
@@ -71,10 +73,12 @@ private:
     type_resolver& _type_resolver;
     record_translator& _record_translator;
     table_creator& _table_creator;
+    lazy_abort_source& _as;
     chunked_hash_map<
       record_schema_components,
       std::unique_ptr<partitioning_writer>>
       _writers;
+    bool _invalid_record_writer{};
 
     std::optional<writer_error> _error;
     std::optional<write_result> _result;

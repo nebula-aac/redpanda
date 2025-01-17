@@ -167,9 +167,9 @@ def data_dependency():
     http_archive(
         name = "seastar",
         build_file = "//bazel/thirdparty:seastar.BUILD",
-        sha256 = "254bd1c2d26bb2d9df8e5217e1c50a2f08bce58b0a6d13cdc692192ee8b79a56",
-        strip_prefix = "seastar-f194d34ef62b5a64364291b941f97a9cd19b7835",
-        url = "https://github.com/redpanda-data/seastar/archive/f194d34ef62b5a64364291b941f97a9cd19b7835.tar.gz",
+        sha256 = "cd235a75a15a2fff0bdc12462d28862ecbc96ac34445725d545c0041f32dfb39",
+        strip_prefix = "seastar-3aa6ca607d0227052301427d400e50bbdd70f37b",
+        url = "https://github.com/redpanda-data/seastar/archive/3aa6ca607d0227052301427d400e50bbdd70f37b.tar.gz",
         patches = ["//bazel/thirdparty:seastar-fortify-source.patch"],
         patch_args = ["-p1"],
     )
@@ -196,4 +196,24 @@ def data_dependency():
         sha256 = "716fbe4fc85ecd36488afbbc635b59b5ab6aba5ed3b69d4a32a46eae5a453d38",
         strip_prefix = "xxHash-bbb27a5efb85b92a0486cf361a8635715a53f6ba",
         url = "https://github.com/Cyan4973/xxHash/archive/bbb27a5efb85b92a0486cf361a8635715a53f6ba.tar.gz",
+    )
+
+    sysroot_build_file = """
+filegroup(
+  name = "sysroot",
+  srcs = glob(["*/**"]),
+  visibility = ["//visibility:public"],
+)"""
+    http_archive(
+        name = "x86_64_sysroot",
+        build_file_content = sysroot_build_file,
+        sha256 = "b7544f6931531eababde47d8723362bc9b3c9de8ef7d9a5d1d62d2e614904d5b",
+        urls = ["http://redpanda-core-toolchain.s3-website-us-east-1.amazonaws.com/sysroot-ubuntu-22.04-x86_64-2025-01-03.tar.gz"],
+    )
+
+    http_archive(
+        name = "aarch64_sysroot",
+        build_file_content = sysroot_build_file,
+        sha256 = "a2d8c3ce82c70f884281db846e756f5877f2c77964cbfb1ba6b954e1f759e2ed",
+        urls = ["http://redpanda-core-toolchain.s3-website-us-east-1.amazonaws.com/sysroot-ubuntu-22.04-aarch64-2025-01-03.tar.gz"],
     )

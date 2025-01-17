@@ -168,18 +168,31 @@ ss::future<> rm_stm::cleanup_evicted_producers() {
         auto pid = co_await _producers_pending_cleanup.pop_eventually();
         auto units = co_await _state_lock.hold_read_lock();
         auto it = _producers.find(pid.get_id());
-        if (it != _producers.end() && it->second->id() == pid) {
-            const auto& producer = *(it->second);
+        if (it == _producers.end()) {
+            vlog(
+              _ctx_log.error,
+              "No producer state found for pid: {}, skipping cleanup",
+              pid);
+            continue;
+        }
+        const auto& producer = *(it->second);
+        if (producer.is_evicted() && producer.id() == pid) {
             if (producer._active_transaction_hook.is_linked()) {
                 vlog(
                   _ctx_log.error,
                   "Ignoring cleanup request of producer {} due to in progress "
                   "transaction.",
                   producer);
-                co_return;
+                continue;
             }
             _producers.erase(it);
             vlog(_ctx_log.trace, "removed producer: {}", pid);
+        } else {
+            vlog(
+              _ctx_log.error,
+              "Skipping cleanup of evicted pid: {} and associated producer: {}",
+              pid,
+              producer);
         }
     }
 }
@@ -225,6 +238,20 @@ ss::future<checked<model::term_id, tx::errc>> rm_stm::begin_tx(
     }
     auto synced_term = _insync_term;
     auto [producer, _] = maybe_create_producer(new_pid);
+    auto log_level = ss::log_level::trace;
+    if (unlikely(producer->is_evicted())) {
+        log_level = ss::log_level::warn;
+    }
+    vlogl(
+      _ctx_log,
+      log_level,
+      "attempting begin_tx with producer: {}, pid: {}, sequence: {}, timeout: "
+      "{}, coordinator partition: {}",
+      *producer,
+      new_pid,
+      tx_seq,
+      transaction_timeout_ms,
+      tm);
     co_return co_await producer->run_with_lock(
       [this,
        synced_term,
@@ -380,9 +407,8 @@ ss::future<checked<model::term_id, tx::errc>> rm_stm::do_begin_tx(
     model::record_batch batch = make_fence_batch(
       pid, tx_seq, transaction_timeout_ms, tm);
 
-    auto reader = model::make_memory_record_batch_reader(std::move(batch));
     auto r = co_await _raft->replicate(
-      synced_term, std::move(reader), make_replicate_options());
+      synced_term, std::move(batch), make_replicate_options());
 
     if (!r) {
         vlog(
@@ -449,6 +475,19 @@ ss::future<tx::errc> rm_stm::commit_tx(
     }
     auto synced_term = _insync_term;
     auto [producer, _] = maybe_create_producer(pid);
+    auto log_level = ss::log_level::trace;
+    if (unlikely(producer->is_evicted())) {
+        log_level = ss::log_level::warn;
+    }
+    vlogl(
+      _ctx_log,
+      log_level,
+      "attempting commit_tx with producer: {}, pid: {}, sequence: {}, timeout: "
+      "{}",
+      *producer,
+      pid,
+      tx_seq,
+      timeout);
     if (pid != producer->id()) {
         co_return tx::errc::fenced;
     }
@@ -527,9 +566,9 @@ ss::future<tx::errc> rm_stm::do_commit_tx(
 
     auto batch = make_tx_control_batch(
       pid, model::control_record_type::tx_commit);
-    auto reader = model::make_memory_record_batch_reader(std::move(batch));
+
     auto r = co_await _raft->replicate(
-      synced_term, std::move(reader), make_replicate_options());
+      synced_term, std::move(batch), make_replicate_options());
 
     if (!r) {
         vlog(
@@ -591,8 +630,21 @@ ss::future<tx::errc> rm_stm::abort_tx(
     }
     auto synced_term = _insync_term;
     auto [producer, _] = maybe_create_producer(pid);
+    auto log_level = ss::log_level::trace;
+    if (unlikely(producer->is_evicted())) {
+        log_level = ss::log_level::warn;
+    }
+    vlogl(
+      _ctx_log,
+      log_level,
+      "attempting abort_tx with producer: {}, pid: {}, sequence: {}, timeout: "
+      "{}",
+      *producer,
+      pid,
+      tx_seq,
+      timeout);
     if (pid != producer->id()) {
-        co_return cluster::errc::invalid_producer_epoch;
+        co_return tx::errc::invalid_producer_epoch;
     }
     co_return co_await producer->run_with_lock(
       [this, synced_term, tx_seq, timeout, producer](
@@ -680,9 +732,8 @@ ss::future<tx::errc> rm_stm::do_abort_tx(
 
     auto batch = make_tx_control_batch(
       pid, model::control_record_type::tx_abort);
-    auto reader = model::make_memory_record_batch_reader(std::move(batch));
     auto r = co_await _raft->replicate(
-      synced_term, std::move(reader), make_replicate_options());
+      synced_term, std::move(batch), make_replicate_options());
 
     if (!r) {
         vlog(
@@ -717,32 +768,36 @@ ss::future<tx::errc> rm_stm::do_abort_tx(
 
 kafka_stages rm_stm::replicate_in_stages(
   model::batch_identity bid,
-  model::record_batch_reader r,
+  model::record_batch batch,
   raft::replicate_options opts) {
     auto enqueued = ss::make_lw_shared<available_promise<>>();
     auto f = enqueued->get_future();
     auto replicate_finished
-      = do_replicate(bid, std::move(r), opts, enqueued).finally([enqueued] {
-            // we should avoid situations when replicate_finished is set while
-            // enqueued isn't because it leads to hanging produce requests and
-            // the resource leaks. since staged replication is an optimization
-            // and setting enqueued only after replicate_finished is already
-            // set doesn't have sematic implications adding this post
-            // replicate_finished as a safety measure in case enqueued isn't
-            // set explicitly
+      = do_replicate(bid, std::move(batch), opts, enqueued).finally([enqueued] {
+            // we should avoid situations when
+            // replicate_finished is set while enqueued
+            // isn't because it leads to hanging produce
+            // requests and the resource leaks. since
+            // staged replication is an optimization and
+            // setting enqueued only after
+            // replicate_finished is already set doesn't
+            // have sematic implications adding this
+            // post replicate_finished as a safety
+            // measure in case enqueued isn't set
+            // explicitly
             if (!enqueued->available()) {
                 enqueued->set_value();
             }
         });
-    return kafka_stages(std::move(f), std::move(replicate_finished));
+    return {std::move(f), std::move(replicate_finished)};
 }
 
 ss::future<result<kafka_result>> rm_stm::replicate(
   model::batch_identity bid,
-  model::record_batch_reader r,
+  model::record_batch batch,
   raft::replicate_options opts) {
     auto enqueued = ss::make_lw_shared<available_promise<>>();
-    return do_replicate(bid, std::move(r), opts, enqueued);
+    return do_replicate(bid, std::move(batch), opts, enqueued);
 }
 
 ss::future<ss::basic_rwlock<>::holder> rm_stm::prepare_transfer_leadership() {
@@ -751,18 +806,18 @@ ss::future<ss::basic_rwlock<>::holder> rm_stm::prepare_transfer_leadership() {
 
 ss::future<result<kafka_result>> rm_stm::do_replicate(
   model::batch_identity bid,
-  model::record_batch_reader b,
+  model::record_batch batch,
   raft::replicate_options opts,
   ss::lw_shared_ptr<available_promise<>> enqueued) {
     auto holder = _gate.hold();
     auto unit = co_await _state_lock.hold_read_lock();
     if (bid.is_transactional) {
-        co_return co_await transactional_replicate(bid, std::move(b));
+        co_return co_await transactional_replicate(bid, std::move(batch));
     } else if (bid.is_idempotent()) {
         co_return co_await idempotent_replicate(
-          bid, std::move(b), opts, enqueued);
+          bid, std::move(batch), opts, enqueued);
     }
-    co_return co_await replicate_msg(std::move(b), opts, enqueued);
+    co_return co_await replicate_msg(std::move(batch), opts, enqueued);
 }
 
 ss::future<> rm_stm::stop() {
@@ -835,9 +890,9 @@ ss::future<result<kafka_result>> rm_stm::transactional_replicate(
   model::term_id synced_term,
   producer_ptr producer,
   model::batch_identity bid,
-  model::record_batch_reader rdr) {
+  model::record_batch batch) {
     auto result = co_await do_transactional_replicate(
-      synced_term, producer, bid, std::move(rdr));
+      synced_term, producer, bid, std::move(batch));
     if (!result) {
         vlog(
           _ctx_log.trace,
@@ -864,7 +919,7 @@ ss::future<result<kafka_result>> rm_stm::do_transactional_replicate(
   model::term_id synced_term,
   producer_ptr producer,
   model::batch_identity bid,
-  model::record_batch_reader rdr) {
+  model::record_batch batch) {
     if (producer->id().epoch != bid.pid.epoch) {
         vlog(
           _ctx_log.warn,
@@ -908,7 +963,7 @@ ss::future<result<kafka_result>> rm_stm::do_transactional_replicate(
     req_ptr->mark_request_in_progress();
 
     auto r = co_await _raft->replicate(
-      synced_term, std::move(rdr), make_replicate_options());
+      synced_term, std::move(batch), make_replicate_options());
     if (!r) {
         vlog(
           _ctx_log.warn,
@@ -939,7 +994,7 @@ ss::future<result<kafka_result>> rm_stm::do_transactional_replicate(
 }
 
 ss::future<result<kafka_result>> rm_stm::transactional_replicate(
-  model::batch_identity bid, model::record_batch_reader rdr) {
+  model::batch_identity bid, model::record_batch batch) {
     if (!check_tx_permitted()) {
         co_return cluster::errc::generic_tx_error;
     }
@@ -955,7 +1010,7 @@ ss::future<result<kafka_result>> rm_stm::transactional_replicate(
     co_return co_await producer->run_with_lock(
       [&, synced_term](ssx::semaphore_units units) {
           return do_transactional_replicate(
-                   synced_term, producer, bid, std::move(rdr))
+                   synced_term, producer, bid, std::move(batch))
             .finally([units = std::move(units)] {});
       });
 }
@@ -964,7 +1019,7 @@ ss::future<result<kafka_result>> rm_stm::idempotent_replicate(
   model::term_id synced_term,
   producer_ptr producer,
   model::batch_identity bid,
-  model::record_batch_reader br,
+  model::record_batch batch,
   raft::replicate_options opts,
   ss::lw_shared_ptr<available_promise<>> enqueued,
   ssx::semaphore_units units,
@@ -973,7 +1028,7 @@ ss::future<result<kafka_result>> rm_stm::idempotent_replicate(
       synced_term,
       producer,
       bid,
-      std::move(br),
+      std::move(batch),
       opts,
       std::move(enqueued),
       units,
@@ -1017,7 +1072,7 @@ ss::future<result<kafka_result>> rm_stm::do_idempotent_replicate(
   model::term_id synced_term,
   producer_ptr producer,
   model::batch_identity bid,
-  model::record_batch_reader br,
+  model::record_batch batch,
   raft::replicate_options opts,
   ss::lw_shared_ptr<available_promise<>> enqueued,
   ssx::semaphore_units& units,
@@ -1055,7 +1110,8 @@ ss::future<result<kafka_result>> rm_stm::do_idempotent_replicate(
     }
 
     req_ptr->mark_request_in_progress();
-    auto stages = _raft->replicate_in_stages(synced_term, std::move(br), opts);
+    auto stages = _raft->replicate_in_stages(
+      synced_term, std::move(batch), opts);
     auto req_enqueued = co_await ss::coroutine::as_future(
       std::move(stages.request_enqueued));
     if (req_enqueued.failed()) {
@@ -1091,7 +1147,7 @@ ss::future<result<kafka_result>> rm_stm::do_idempotent_replicate(
 
 ss::future<result<kafka_result>> rm_stm::idempotent_replicate(
   model::batch_identity bid,
-  model::record_batch_reader br,
+  model::record_batch batch,
   raft::replicate_options opts,
   ss::lw_shared_ptr<available_promise<>> enqueued) {
     if (!co_await sync(_sync_timeout())) {
@@ -1108,7 +1164,7 @@ ss::future<result<kafka_result>> rm_stm::idempotent_replicate(
                 synced_term,
                 producer,
                 bid,
-                std::move(br),
+                std::move(batch),
                 opts,
                 std::move(enqueued),
                 std::move(units),
@@ -1127,7 +1183,7 @@ ss::future<result<kafka_result>> rm_stm::idempotent_replicate(
 }
 
 ss::future<result<kafka_result>> rm_stm::replicate_msg(
-  model::record_batch_reader br,
+  model::record_batch batch,
   raft::replicate_options opts,
   ss::lw_shared_ptr<available_promise<>> enqueued) {
     using ret_t = result<kafka_result>;
@@ -1136,7 +1192,7 @@ ss::future<result<kafka_result>> rm_stm::replicate_msg(
         co_return cluster::errc::not_leader;
     }
 
-    auto ss = _raft->replicate_in_stages(_insync_term, std::move(br), opts);
+    auto ss = _raft->replicate_in_stages(_insync_term, std::move(batch), opts);
     co_await std::move(ss.request_enqueued);
     enqueued->set_value();
     auto r = co_await std::move(ss.replicate_finished);
@@ -1159,10 +1215,10 @@ model::offset rm_stm::last_stable_offset() {
 
     // We always want to return only the `applied` state as it
     // contains aborted transactions metadata that is consumed by
-    // the client to distinguish aborted data batches.
+    // the client to distinguish aborted data batch.
     //
     // We optimize for the case where there are no inflight transactional
-    // batches to return the high water mark.
+    // batch to return the high water mark.
     auto last_applied = last_applied_offset();
     if (unlikely(
           !_bootstrap_committed_offset
@@ -1399,10 +1455,8 @@ ss::future<tx::errc> rm_stm::do_try_abort_old_tx(producer_ptr producer) {
                   _ctx_log.trace, "pid:{} tx_seq:{} is committed", pid, tx_seq);
                 auto batch = make_tx_control_batch(
                   pid, model::control_record_type::tx_commit);
-                auto reader = model::make_memory_record_batch_reader(
-                  std::move(batch));
                 auto cr = co_await _raft->replicate(
-                  synced_term, std::move(reader), make_replicate_options());
+                  synced_term, std::move(batch), make_replicate_options());
                 if (!cr) {
                     vlog(
                       _ctx_log.warn,
@@ -1440,10 +1494,8 @@ ss::future<tx::errc> rm_stm::do_try_abort_old_tx(producer_ptr producer) {
                   _ctx_log.trace, "pid:{} tx_seq:{} is aborted", pid, tx_seq);
                 auto batch = make_tx_control_batch(
                   pid, model::control_record_type::tx_abort);
-                auto reader = model::make_memory_record_batch_reader(
-                  std::move(batch));
                 auto cr = co_await _raft->replicate(
-                  synced_term, std::move(reader), make_replicate_options());
+                  synced_term, std::move(batch), make_replicate_options());
                 if (!cr) {
                     vlog(
                       _ctx_log.warn,
@@ -1495,9 +1547,8 @@ ss::future<tx::errc> rm_stm::do_try_abort_old_tx(producer_ptr producer) {
         auto batch = make_tx_control_batch(
           pid, model::control_record_type::tx_abort);
 
-        auto reader = model::make_memory_record_batch_reader(std::move(batch));
         auto cr = co_await _raft->replicate(
-          _insync_term, std::move(reader), make_replicate_options());
+          _insync_term, std::move(batch), make_replicate_options());
 
         if (!cr) {
             vlog(
@@ -1540,7 +1591,7 @@ void rm_stm::maybe_rearm_autoabort_timer(time_point_type deadline) {
 
 ss::future<tx::errc> rm_stm::abort_all_txes() {
     if (!co_await sync(_sync_timeout())) {
-        co_return cluster::errc::not_leader;
+        co_return tx::errc::stale;
     }
 
     tx::errc last_err = tx::errc::none;
@@ -1585,7 +1636,7 @@ ss::future<> rm_stm::do_apply(const model::record_batch& b) {
         apply_fence(bid.pid, b.copy());
     } else if (hdr.type == model::record_batch_type::tx_prepare) {
         // prepare phase was used pre-transactions GA. Ideally these
-        // batches should not appear anymore and should not be a part
+        // batch should not appear anymore and should not be a part
         // of Redpanda deployments from the recent past. Still logging
         // it at warn for debugging.
         vlog(
@@ -1684,7 +1735,7 @@ model::offset rm_stm::to_log_offset(kafka::offset k_offset) const {
     return model::offset(k_offset);
 }
 
-ss::future<>
+ss::future<raft::local_snapshot_applied>
 rm_stm::apply_local_snapshot(raft::stm_snapshot_header hdr, iobuf&& tx_ss_buf) {
     auto units = co_await _state_lock.hold_write_lock();
 
@@ -1707,7 +1758,7 @@ rm_stm::apply_local_snapshot(raft::stm_snapshot_header hdr, iobuf&& tx_ss_buf) {
         data = co_await serde::read_async<tx_snapshot_v6>(data_parser);
     } else {
         vlog(_ctx_log.error, "Ignored snapshot version {}", hdr.version);
-        co_return;
+        co_return raft::local_snapshot_applied::no;
     }
 
     _highest_producer_id = std::max(
@@ -1792,6 +1843,7 @@ rm_stm::apply_local_snapshot(raft::stm_snapshot_header hdr, iobuf&& tx_ss_buf) {
               snapshot_opt.value());
         }
     }
+    co_return raft::local_snapshot_applied::yes;
 }
 
 uint8_t rm_stm::active_snapshot_version() {

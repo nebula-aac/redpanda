@@ -10,8 +10,10 @@
  */
 #pragma once
 
+#include "bytes/random.h"
 #include "compat/generator.h"
 #include "model/tests/random_batch.h"
+#include "raft/transfer_leadership.h"
 #include "raft/types.h"
 #include "random/generators.h"
 #include "test_utils/randoms.h"
@@ -347,7 +349,7 @@ struct instance_generator<raft::append_entries_reply> {
             {raft::reply_result::success,
              raft::reply_result::failure,
              raft::reply_result::group_unavailable,
-             raft::reply_result::timeout}),
+             raft::reply_result::follower_busy}),
           .may_recover = tests::random_bool(),
         };
     }

@@ -78,7 +78,7 @@ ss::futurize_t<FuncRet> retry_with_backoff(
 }
 
 // Creates or alters the table by delegating to the coordinator.
-class coordinator_table_creator : public table_creator {
+class coordinator_table_creator final : public table_creator {
 public:
     explicit coordinator_table_creator(coordinator::frontend& fe)
       : coordinator_fe_(fe) {}
@@ -92,6 +92,24 @@ public:
             topic,
             topic_revision,
             comps,
+          });
+        switch (ensure_res.errc) {
+        case coordinator::errc::ok:
+            co_return std::nullopt;
+        case coordinator::errc::incompatible_schema:
+            co_return errc::incompatible_schema;
+        default:
+            co_return errc::failed;
+        }
+    }
+
+    ss::future<checked<std::nullopt_t, errc>> ensure_dlq_table(
+      const model::topic& topic,
+      const model::revision_id topic_revision) const final {
+        auto ensure_res = co_await coordinator_fe_.ensure_dlq_table_exists(
+          coordinator::ensure_dlq_table_exists_request{
+            topic,
+            topic_revision,
           });
         switch (ensure_res.errc) {
         case coordinator::errc::ok:
@@ -210,13 +228,13 @@ partition_translator::max_offset_for_translation() const {
 ss::future<std::optional<coordinator::translated_offset_range>>
 partition_translator::do_translation_for_range(
   retry_chain_node& parent,
-  model::record_batch_reader rdr,
-  kafka::offset begin_offset) {
+  kafka::offset read_begin_offset,
+  kafka::offset read_end_offset) {
     // This configuration only writes a single row group per file but we limit
     // the bytes via the reader max_bytes.
     auto writer_factory = std::make_unique<local_parquet_file_writer_factory>(
-      local_path{_writer_scratch_space}, // storage temp files are written to
-      fmt::format("{}", begin_offset),   // file prefix
+      local_path{_writer_scratch_space},    // storage temp files are written to
+      fmt::format("{}", read_begin_offset), // file prefix
       ss::make_shared<serde_parquet_writer_factory>());
 
     auto task = translation_task{
@@ -232,11 +250,39 @@ partition_translator::do_translation_for_range(
         return can_continue() ? std::nullopt
                               : std::make_optional("translator stopping");
     }};
+
+    vlog(
+      _logger.debug,
+      "translating data in kafka range: [{}, {}]",
+      read_begin_offset,
+      read_end_offset);
+
+    auto log_reader = co_await _partition_proxy->make_reader(
+      {kafka::offset_cast(read_begin_offset),
+       kafka::offset_cast(read_end_offset),
+       0,
+       _max_bytes_per_reader,
+       datalake_priority(),
+       std::nullopt,
+       std::nullopt,
+       _as});
+    auto tracker = kafka::aborted_transaction_tracker::create_default(
+      _partition_proxy.get(), std::move(log_reader.ot_state));
+    auto kafka_reader
+      = model::make_record_batch_reader<kafka::read_committed_reader>(
+        std::move(tracker), std::move(log_reader.reader));
+    const translation_task::custom_partitioning_enabled is_cp_enabled{
+      _features->local().is_active(features::feature::datalake_iceberg_ga)};
+    // Be wary of introducing abortable code here that can skip cleanup
+    // of kafka_reader. The reader is cleaned up along with consumption,
+    // so we need to ensure that the reader is dispatched to translation
+    // in all cases.
     auto result = co_await task.translate(
       ntp,
       _partition->get_topic_revision_id(),
       std::move(writer_factory),
-      std::move(rdr),
+      is_cp_enabled,
+      std::move(kafka_reader),
       remote_path_prefix,
       parent,
       las);
@@ -289,29 +335,12 @@ partition_translator::do_translate_once(retry_chain_node& parent_rcn) {
     // accumulate. The resulting parquet files are only performant
     // if there is a big chunk of data in them. Smaller parquet files
     // are an overhead for iceberg metadata.
-    auto log_reader = co_await _partition_proxy->make_reader(
-      {kafka::offset_cast(read_begin_offset),
-       kafka::offset_cast(read_end_offset),
-       0,
-       _max_bytes_per_reader,
-       datalake_priority(),
-       std::nullopt,
-       std::nullopt,
-       _as});
-
     auto units = co_await ss::get_units(**_parallel_translations, 1, _as);
-    vlog(
-      _logger.debug,
-      "translating data in kafka range: [{}, {}]",
-      read_begin_offset,
-      read_end_offset);
-    auto tracker = kafka::aborted_transaction_tracker::create_default(
-      _partition_proxy.get(), std::move(log_reader.ot_state));
-    auto kafka_reader
-      = model::make_record_batch_reader<kafka::read_committed_reader>(
-        std::move(tracker), std::move(log_reader.reader));
+
     auto translation_result = co_await do_translation_for_range(
-      parent_rcn, std::move(kafka_reader), read_begin_offset);
+      parent_rcn, read_begin_offset, read_end_offset);
+
+    // release units and checkpoint outside of the lock.
     units.return_all();
     vlog(_logger.debug, "translation result: {}", translation_result);
     auto result = translation_success::no;

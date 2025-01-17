@@ -11,7 +11,8 @@
 
 #include "base/vlog.h"
 #include "datalake/logger.h"
-#include "datalake/table_definition.h"
+#include "iceberg/compatibility.h"
+#include "iceberg/datatypes.h"
 #include "iceberg/field_collecting_visitor.h"
 #include "iceberg/table_identifier.h"
 #include "iceberg/transaction.h"
@@ -36,10 +37,13 @@ schema_manager::errc log_and_convert_catalog_err(
 }
 enum class fill_errc {
     // There is a mismatch in a field's type, name, or required.
-    mismatch,
+    invalid_schema,
     // We couldn't fill all the columns, but the ones we could all matched.
-    incomplete,
+    // Or one or more columns were type-promoted (legally), so we'll need to
+    // push an update into the catalog.
+    schema_evolution_needed,
 };
+
 // Performs a simultaneous, depth-first iteration through fields of the two
 // schemas, filling dest's field IDs with those from the source. Returns
 // successfully if all the field IDs in the destination type are filled.
@@ -56,23 +60,28 @@ fill_field_ids(iceberg::struct_type& dest, const iceberg::struct_type& source) {
     for (auto& f : std::ranges::reverse_view(source.fields)) {
         source_stack.emplace_back(f.get());
     }
+    bool has_primitive_type_promotion{false};
     while (!source_stack.empty() && !dest_stack.empty()) {
         auto* dst = dest_stack.back();
         auto* src = source_stack.back();
-        if (
-          dst->name != src->name || dst->required != src->required
-          || dst->type.index() != src->type.index()) {
-            return fill_errc::mismatch;
+        if (auto compatibility = check_types(src->type, dst->type);
+            dst->name != src->name || dst->required != src->required
+            || compatibility.has_error()) {
+            return fill_errc::invalid_schema;
+        } else if (compatibility.value() == type_promoted::yes) {
+            has_primitive_type_promotion = true;
         }
+
         dst->id = src->id;
         dest_stack.pop_back();
         source_stack.pop_back();
         std::visit(reverse_field_collecting_visitor(dest_stack), dst->type);
         std::visit(reverse_field_collecting_visitor(source_stack), src->type);
     }
-    if (!dest_stack.empty()) {
+
+    if (!dest_stack.empty() || has_primitive_type_promotion) {
         // There are more fields to fill.
-        return fill_errc::incomplete;
+        return fill_errc::schema_evolution_needed;
     }
     // We successfully filled all the fields in the destination.
     return std::nullopt;
@@ -90,31 +99,63 @@ std::ostream& operator<<(std::ostream& o, const schema_manager::errc& e) {
     }
 }
 
-ss::future<checked<std::nullopt_t, schema_manager::errc>>
-simple_schema_manager::ensure_table_schema(
-  const model::topic&, const iceberg::struct_type&) {
-    co_return std::nullopt;
+bool schema_manager::table_info::fill_registered_ids(
+  iceberg::struct_type& type) {
+    auto fill_res = fill_field_ids(type, schema.schema_struct);
+    return !fill_res.has_error();
 }
 
 ss::future<checked<std::nullopt_t, schema_manager::errc>>
-simple_schema_manager::get_registered_ids(
-  const model::topic&, iceberg::struct_type& desired_type) {
+simple_schema_manager::ensure_table_schema(
+  const iceberg::table_identifier& table_id,
+  const iceberg::struct_type& desired_type,
+  const iceberg::unresolved_partition_spec& partition_spec) {
     iceberg::schema s{
-      .schema_struct = std::move(desired_type),
+      .schema_struct = desired_type.copy(),
       .schema_id = {},
       .identifier_field_ids = {},
     };
     s.assign_fresh_ids();
-    desired_type = std::move(s.schema_struct);
+
+    auto resolve_res = iceberg::partition_spec::resolve(
+      partition_spec, s.schema_struct);
+    if (!resolve_res) {
+        co_return errc::failed;
+    }
+
+    // TODO: check schema compatibility
+    table_info_by_id.insert_or_assign(
+      table_id.copy(),
+      table_info{
+        .id = table_id.copy(),
+        .schema = std::move(s),
+        .partition_spec = std::move(resolve_res.value()),
+      });
+
     co_return std::nullopt;
+}
+
+ss::future<checked<schema_manager::table_info, schema_manager::errc>>
+simple_schema_manager::get_table_info(
+  const iceberg::table_identifier& table_id) {
+    auto it = table_info_by_id.find(table_id);
+    if (it == table_info_by_id.end()) {
+        co_return errc::failed;
+    }
+    co_return table_info{
+      .id = it->second.id.copy(),
+      .schema = it->second.schema.copy(),
+      .partition_spec = it->second.partition_spec.copy(),
+    };
 }
 
 ss::future<checked<std::nullopt_t, schema_manager::errc>>
 catalog_schema_manager::ensure_table_schema(
-  const model::topic& topic, const iceberg::struct_type& desired_type) {
-    auto table_id = table_id_for_topic(topic);
+  const iceberg::table_identifier& table_id,
+  const iceberg::struct_type& desired_type,
+  const iceberg::unresolved_partition_spec& partition_spec) {
     auto load_res = co_await catalog_.load_or_create_table(
-      table_id, desired_type, hour_partition_spec());
+      table_id, desired_type, partition_spec);
     if (load_res.has_error()) {
         co_return log_and_convert_catalog_err(
           load_res.error(), fmt::format("Error loading table {}", table_id));
@@ -165,10 +206,9 @@ catalog_schema_manager::ensure_table_schema(
     co_return std::nullopt;
 }
 
-ss::future<checked<std::nullopt_t, schema_manager::errc>>
-catalog_schema_manager::get_registered_ids(
-  const model::topic& topic, iceberg::struct_type& dest_type) {
-    auto table_id = table_id_for_topic(topic);
+ss::future<checked<schema_manager::table_info, schema_manager::errc>>
+catalog_schema_manager::get_table_info(
+  const iceberg::table_identifier& table_id) {
     auto load_res = co_await catalog_.load_table(table_id);
     if (load_res.has_error()) {
         co_return log_and_convert_catalog_err(
@@ -176,20 +216,33 @@ catalog_schema_manager::get_registered_ids(
           fmt::format(
             "Error while reloading table {} after schema update", table_id));
     }
-    auto get_res = get_ids_from_table_meta(
-      table_id, load_res.value(), dest_type);
-    if (get_res.has_error()) {
-        co_return get_res.error();
-    }
-    if (!get_res.value()) {
+    const auto& table = load_res.value();
+
+    auto cur_schema = table.get_schema(table.current_schema_id);
+    if (!cur_schema) {
         vlog(
-          datalake_log.warn,
-          "expected to successfully fill field IDs for table {}",
+          datalake_log.error,
+          "Cannot find current schema {} in table {}",
+          table.current_schema_id,
           table_id);
         co_return errc::failed;
     }
-    // Success! We got all the field IDs.
-    co_return std::nullopt;
+
+    auto cur_spec = table.get_partition_spec(table.default_spec_id);
+    if (!cur_spec) {
+        vlog(
+          datalake_log.error,
+          "Cannot find default partition spec {} in table {}",
+          table.default_spec_id,
+          table_id);
+        co_return errc::failed;
+    }
+
+    co_return table_info{
+      .id = table_id.copy(),
+      .schema = cur_schema->copy(),
+      .partition_spec = cur_spec->copy(),
+    };
 }
 
 checked<bool, schema_manager::errc>
@@ -212,23 +265,14 @@ catalog_schema_manager::get_ids_from_table_meta(
     auto fill_res = fill_field_ids(dest_type, schema_iter->schema_struct);
     if (fill_res.has_error()) {
         switch (fill_res.error()) {
-        case fill_errc::mismatch:
+        case fill_errc::invalid_schema:
             vlog(datalake_log.warn, "Type mismatch with table {}", table_id);
             return errc::not_supported;
-        case fill_errc::incomplete:
+        case fill_errc::schema_evolution_needed:
             return false;
         }
     }
     return true;
-}
-
-iceberg::table_identifier
-schema_manager::table_id_for_topic(const model::topic& t) const {
-    return iceberg::table_identifier{
-      // TODO: namespace as a topic property? Keep it in the table metadata?
-      .ns = {"redpanda"},
-      .table = t,
-    };
 }
 
 } // namespace datalake

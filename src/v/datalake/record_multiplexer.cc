@@ -16,6 +16,7 @@
 #include "datalake/record_schema_resolver.h"
 #include "datalake/record_translator.h"
 #include "datalake/table_creator.h"
+#include "datalake/table_id_provider.h"
 #include "model/record.h"
 #include "storage/parser_utils.h"
 
@@ -30,7 +31,8 @@ record_multiplexer::record_multiplexer(
   schema_manager& schema_mgr,
   type_resolver& type_resolver,
   record_translator& record_translator,
-  table_creator& table_creator)
+  table_creator& table_creator,
+  lazy_abort_source& as)
   : _log(datalake_log, fmt::format("{}", ntp))
   , _ntp(ntp)
   , _topic_revision(topic_revision)
@@ -38,10 +40,18 @@ record_multiplexer::record_multiplexer(
   , _schema_mgr(schema_mgr)
   , _type_resolver(type_resolver)
   , _record_translator(record_translator)
-  , _table_creator(table_creator) {}
+  , _table_creator(table_creator)
+  , _as(as) {}
 
 ss::future<ss::stop_iteration>
 record_multiplexer::operator()(model::record_batch batch) {
+    if (_as.abort_requested()) {
+        vlog(
+          _log.debug,
+          "Abort requested, stopping translation, reason: {}",
+          _as.abort_reason());
+        co_return ss::stop_iteration::yes;
+    }
     if (batch.compressed()) {
         batch = co_await storage::internal::decompress_batch(std::move(batch));
     }
@@ -50,6 +60,13 @@ record_multiplexer::operator()(model::record_batch batch) {
     auto it = model::record_batch_iterator::create(batch);
 
     while (it.has_next()) {
+        if (_as.abort_requested()) {
+            vlog(
+              _log.debug,
+              "Abort requested, stopping translation, reason: {}",
+              _as.abort_reason());
+            co_return ss::stop_iteration::yes;
+        }
         auto record = it.next();
         auto key = record.share_key_opt();
         auto val = record.share_value_opt();
@@ -151,18 +168,18 @@ record_multiplexer::operator()(model::record_batch batch) {
                 co_return ss::stop_iteration::yes;
             }
 
-            auto get_ids_res = co_await _schema_mgr.get_registered_ids(
-              _ntp.tp.topic, record_type.type);
-            if (get_ids_res.has_error()) {
-                auto e = get_ids_res.error();
+            auto table_id = table_id_provider::table_id(_ntp.tp.topic);
+            auto load_res = co_await _schema_mgr.get_table_info(table_id);
+            if (load_res.has_error()) {
+                auto e = load_res.error();
                 switch (e) {
                 case schema_manager::errc::not_supported:
                 case schema_manager::errc::failed:
                     vlog(
                       _log.warn,
-                      "Error getting field IDs for record {}: {}",
+                      "Error getting table info for record {}: {}",
                       offset,
-                      get_ids_res.error());
+                      load_res.error());
                     [[fallthrough]];
                 case schema_manager::errc::shutting_down:
                     _error = writer_error::parquet_conversion_error;
@@ -170,10 +187,25 @@ record_multiplexer::operator()(model::record_batch batch) {
                 co_return ss::stop_iteration::yes;
             }
 
+            if (!load_res.value().fill_registered_ids(record_type.type)) {
+                // This shouldn't happen because we ensured the schema with the
+                // call to table_creator. Probably someone managed to change the
+                // table between two calls.
+                vlog(
+                  _log.warn,
+                  "expected to successfully fill field IDs for record {}",
+                  offset);
+                _error = writer_error::parquet_conversion_error;
+                co_return ss::stop_iteration::yes;
+            }
+
             auto [iter, _] = _writers.emplace(
               record_type.comps,
               std::make_unique<partitioning_writer>(
-                *_writer_factory, std::move(record_type.type)));
+                *_writer_factory,
+                load_res.value().schema.schema_id,
+                std::move(record_type.type),
+                std::move(load_res.value().partition_spec)));
             writer_iter = iter;
         }
 
@@ -242,6 +274,30 @@ record_multiplexer::handle_invalid_record(
     vlog(_log.debug, "Dropping invalid record at offset {}", offset);
     // TODO: add a metric!
     // TODO: dead-letter table?
+
+    if (!_invalid_record_writer) {
+        auto ensure_res = co_await _table_creator.ensure_dlq_table(
+          _ntp.tp.topic, _topic_revision);
+
+        if (ensure_res.has_error()) {
+            auto e = ensure_res.error();
+            switch (e) {
+            case table_creator::errc::incompatible_schema:
+                [[fallthrough]];
+            case table_creator::errc::failed:
+                [[fallthrough]];
+            case table_creator::errc::shutting_down:
+                vlog(
+                  _log.warn,
+                  "Error ensuring DLQ table schema for invalid record {}",
+                  offset);
+                co_return writer_error::parquet_conversion_error;
+            }
+        }
+
+        _invalid_record_writer = true;
+    }
+
     co_return std::nullopt;
 }
 } // namespace datalake

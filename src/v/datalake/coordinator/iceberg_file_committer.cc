@@ -15,14 +15,16 @@
 #include "datalake/coordinator/state.h"
 #include "datalake/coordinator/state_update.h"
 #include "datalake/logger.h"
-#include "datalake/table_definition.h"
+#include "datalake/table_id_provider.h"
 #include "iceberg/catalog.h"
 #include "iceberg/manifest_entry.h"
 #include "iceberg/manifest_io.h"
 #include "iceberg/partition_key.h"
+#include "iceberg/table_identifier.h"
 #include "iceberg/table_metadata.h"
 #include "iceberg/transaction.h"
 #include "iceberg/values.h"
+#include "iceberg/values_bytes.h"
 
 namespace datalake::coordinator {
 namespace {
@@ -99,17 +101,24 @@ ss::future<
   checked<chunked_vector<mark_files_committed_update>, file_committer::errc>>
 iceberg_file_committer::commit_topic_files_to_catalog(
   model::topic topic, const topics_state& state) const {
+    vlog(datalake_log.debug, "Beginning commit for topic {}", topic);
     auto tp_it = state.topic_to_state.find(topic);
     if (
       tp_it == state.topic_to_state.end()
       || !tp_it->second.has_pending_entries()) {
+        vlog(datalake_log.debug, "Topic {} has no pending entries", topic);
         co_return chunked_vector<mark_files_committed_update>{};
     }
     auto topic_revision = tp_it->second.revision;
 
-    auto table_id = table_id_for_topic(topic);
+    auto table_id = table_id_provider::table_id(topic);
     auto table_res = co_await load_table(table_id);
     if (table_res.has_error()) {
+        vlog(
+          datalake_log.warn,
+          "Error loading table {} for committing from topic {}",
+          table_id,
+          topic);
         co_return table_res.error();
     }
     auto& table = table_res.value();
@@ -130,6 +139,13 @@ iceberg_file_committer::commit_topic_files_to_catalog(
     if (
       tp_it == state.topic_to_state.end()
       || tp_it->second.revision != topic_revision) {
+        vlog(
+          datalake_log.debug,
+          "Commit returning early, topic {} state is missing or revision has "
+          "changed: current {} vs expected {}",
+          topic,
+          tp_it->second.revision,
+          topic_revision);
         co_return chunked_vector<mark_files_committed_update>{};
     }
 
@@ -148,6 +164,16 @@ iceberg_file_committer::commit_topic_files_to_catalog(
                 // replicate the fact that it was committed previously, but
                 // don't construct a data_file to send to Iceberg as it is
                 // already committed.
+                vlog(
+                  datalake_log.debug,
+                  "Skipping entry for topic {} revision {} added at "
+                  "coordinator offset {} because table {} has data including "
+                  "coordinator offset {}",
+                  topic,
+                  topic_revision,
+                  e.added_pending_at,
+                  table_id,
+                  *iceberg_commit_meta_opt);
                 continue;
             }
             new_committed_offset = std::max(
@@ -155,8 +181,82 @@ iceberg_file_committer::commit_topic_files_to_catalog(
               std::make_optional<model::offset>(e.added_pending_at));
             for (const auto& f : e.data.files) {
                 auto pk = std::make_unique<iceberg::struct_value>();
-                pk->fields.emplace_back(iceberg::int_value{f.hour});
-                icb_files.emplace_back(iceberg::data_file{
+                if (f.table_schema_id >= 0) {
+                    auto schema_id = iceberg::schema::id_t{f.table_schema_id};
+                    auto schema = table.get_schema(schema_id);
+                    if (!schema) {
+                        vlog(
+                          datalake_log.error,
+                          "can't find schema {} in table for topic {}",
+                          schema_id,
+                          topic);
+                        co_return errc::failed;
+                    }
+
+                    auto pspec_id = iceberg::partition_spec::id_t{
+                      f.partition_spec_id};
+                    auto partition_spec = table.get_partition_spec(pspec_id);
+                    if (!partition_spec) {
+                        vlog(
+                          datalake_log.error,
+                          "can't find partition spec {} in table for topic {}",
+                          pspec_id,
+                          topic);
+                        co_return errc::failed;
+                    }
+
+                    if (
+                      partition_spec->fields.size() != f.partition_key.size()) {
+                        vlog(
+                          datalake_log.error,
+                          "[topic: {}, file: {}] partition key size {} doesn't "
+                          "match spec size {} (spec id: {})",
+                          topic,
+                          f.remote_path,
+                          f.partition_key.size(),
+                          partition_spec->fields.size(),
+                          pspec_id);
+                        co_return errc::failed;
+                    }
+
+                    auto key_type = iceberg::partition_key_type::create(
+                      *partition_spec, *schema);
+
+                    for (size_t i = 0; i < partition_spec->fields.size(); ++i) {
+                        const auto& field_type = key_type.type.fields.at(i);
+                        const auto& field_bytes = f.partition_key.at(i);
+                        if (field_bytes) {
+                            try {
+                                pk->fields.push_back(iceberg::value_from_bytes(
+                                  field_type->type, field_bytes.value()));
+                            } catch (const std::invalid_argument& e) {
+                                vlog(
+                                  datalake_log.error,
+                                  "[topic: {}, file: {}] failed to parse "
+                                  "partition key field {} (type: {}): {}",
+                                  topic,
+                                  f.remote_path,
+                                  i,
+                                  field_type->type,
+                                  e);
+                                co_return errc::failed;
+                            }
+                        } else {
+                            pk->fields.push_back(std::nullopt);
+                        }
+                    }
+                } else {
+                    // File created by a legacy Redpanda version that only
+                    // supported hourly partitioning, the partition key value is
+                    // in the hour_deprecated field.
+                    pk->fields.emplace_back(
+                      iceberg::int_value{f.hour_deprecated});
+                }
+
+                // TODO: pass schema_id and pspec_id to merge_append_action
+                // (currently it assumes that the files were serialized with the
+                // current schema and a single partition spec).
+                icb_files.push_back({
                   .content_type = iceberg::data_file_content_type::data,
                   .file_path = io_.to_uri(std::filesystem::path(f.remote_path)),
                   .file_format = iceberg::data_file_format::parquet,
@@ -168,6 +268,11 @@ iceberg_file_committer::commit_topic_files_to_catalog(
         }
     }
     if (pending_commits.empty()) {
+        vlog(
+          datalake_log.debug,
+          "No new data to mark committed for topic {} revision {}",
+          topic,
+          topic_revision);
         co_return chunked_vector<mark_files_committed_update>{};
     }
     chunked_vector<mark_files_committed_update> updates;
@@ -187,6 +292,12 @@ iceberg_file_committer::commit_topic_files_to_catalog(
     }
     if (icb_files.empty()) {
         // All files are deduplicated.
+        vlog(
+          datalake_log.debug,
+          "All committed files were deduplicated for topic {} revision {}, "
+          "returning without updating Iceberg catalog",
+          topic,
+          topic_revision);
         co_return updates;
     }
     vassert(
@@ -195,6 +306,11 @@ iceberg_file_committer::commit_topic_files_to_catalog(
     const auto commit_meta = commit_offset_metadata{
       .offset = *new_committed_offset,
     };
+    vlog(
+      datalake_log.debug,
+      "Adding {} files to Iceberg table {}",
+      icb_files.size(),
+      table_id);
     iceberg::transaction txn(std::move(table));
     auto icb_append_res = co_await txn.merge_append(
       io_,
@@ -217,8 +333,8 @@ iceberg_file_committer::commit_topic_files_to_catalog(
 }
 
 ss::future<checked<std::nullopt_t, file_committer::errc>>
-iceberg_file_committer::drop_table(const model::topic& topic) const {
-    auto table_id = table_id_for_topic(topic);
+iceberg_file_committer::drop_table(
+  const iceberg::table_identifier& table_id) const {
     auto drop_res = co_await catalog_.drop_table(table_id, true);
     if (
       drop_res.has_error()
@@ -227,15 +343,6 @@ iceberg_file_committer::drop_table(const model::topic& topic) const {
           drop_res.error(), fmt::format("Failed to drop {}", table_id));
     }
     co_return std::nullopt;
-}
-
-iceberg::table_identifier
-iceberg_file_committer::table_id_for_topic(const model::topic& t) const {
-    return iceberg::table_identifier{
-      // TODO: namespace as a topic property? Keep it in the table metadata?
-      .ns = {"redpanda"},
-      .table = t,
-    };
 }
 
 ss::future<checked<iceberg::table_metadata, file_committer::errc>>

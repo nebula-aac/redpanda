@@ -10,9 +10,10 @@ redpanda_cc_library(
     ],
     implementation_deps = [
         ":logger",
-        ":table_definition",
         "//src/v/base",
+        "//src/v/iceberg:compatibility",
         "//src/v/iceberg:field_collecting_visitor",
+        "//src/v/iceberg:partition",
         "//src/v/iceberg:schema",
         "//src/v/iceberg:transaction",
     ],
@@ -112,7 +113,6 @@ redpanda_cc_library(
     ],
     implementation_deps = [
         ":logger",
-        ":table_definition",
         "//src/v/base",
         "//src/v/iceberg:struct_accessor",
     ],
@@ -123,6 +123,7 @@ redpanda_cc_library(
         "//src/v/container:chunked_hash_map",
         "//src/v/iceberg:datatypes",
         "//src/v/iceberg:partition_key",
+        "//src/v/iceberg:schema",
         "//src/v/iceberg:values",
     ],
 )
@@ -217,6 +218,7 @@ redpanda_cc_library(
         ":writer",
         "//src/v/base",
         "//src/v/datalake/coordinator:translated_offset_range",
+        "//src/v/iceberg:values_bytes",
         "//src/v/model",
         "//src/v/utils:lazy_abort_source",
         "//src/v/utils:retry_chain_node",
@@ -343,8 +345,10 @@ redpanda_cc_library(
         ":record_schema_resolver",
         ":record_translator",
         ":table_creator",
+        ":table_id_provider",
         "//src/v/base",
         "//src/v/storage:parser_utils",
+        "//src/v/utils:lazy_abort_source",
         "//src/v/utils:prefix_logger",
     ],
     include_prefix = "datalake",
@@ -374,6 +378,8 @@ redpanda_cc_library(
         ":schema_avro",
         ":schema_protobuf",
         ":schema_registry",
+        "//src/v/config",
+        "//src/v/metrics",
         "//src/v/pandaproxy",
         "//src/v/schema:registry",
         "@avro",
@@ -385,6 +391,7 @@ redpanda_cc_library(
         ":schema_identifier",
         "//src/v/base",
         "//src/v/iceberg:datatypes",
+        "//src/v/utils:chunked_kv_cache",
         "@seastar",
     ],
 )
@@ -543,13 +550,22 @@ redpanda_cc_library(
     hdrs = [
         "table_creator.h",
     ],
-    implementation_deps = [
-        ":record_translator",
+    include_prefix = "datalake",
+    visibility = [":__subpackages__"],
+    deps = [
+        ":schema_identifier",
+    ],
+)
+
+redpanda_cc_library(
+    name = "table_id_provider",
+    hdrs = [
+        "table_id_provider.h",
     ],
     include_prefix = "datalake",
     visibility = [":__subpackages__"],
     deps = [
-        ":catalog_schema_manager",
-        ":record_schema_resolver",
+        "//src/v/iceberg:table_identifier",
+        "//src/v/model",
     ],
 )

@@ -12,6 +12,7 @@
 
 #include "datalake/logger.h"
 #include "datalake/translation/types.h"
+#include "datalake/translation/utils.h"
 
 namespace {
 raft::replicate_options make_replicate_options() {
@@ -20,14 +21,13 @@ raft::replicate_options make_replicate_options() {
     return opts;
 }
 
-model::record_batch_reader make_translation_state_batch(kafka::offset offset) {
+model::record_batch make_translation_state_batch(kafka::offset offset) {
     auto val = datalake::translation::translation_state{
       .highest_translated_offset = offset};
     storage::record_batch_builder builder(
       model::record_batch_type::datalake_translation_state, model::offset(0));
     builder.add_raw_kv(std::nullopt, serde::to_iobuf(val));
-    auto batch = std::move(builder).build();
-    return model::make_memory_record_batch_reader(std::move(batch));
+    return std::move(builder).build();
 }
 
 } // namespace
@@ -117,15 +117,16 @@ model::offset translation_stm::max_collectible_offset() {
     if (_highest_translated_offset == kafka::offset{}) {
         return model::offset{};
     }
-    return _raft->log()->to_log_offset(
-      kafka::offset_cast(_highest_translated_offset));
+
+    return highest_log_offset_below_next(
+      _raft->log(), _highest_translated_offset);
 }
 
-ss::future<> translation_stm::apply_local_snapshot(
+ss::future<raft::local_snapshot_applied> translation_stm::apply_local_snapshot(
   raft::stm_snapshot_header, iobuf&& bytes) {
     _highest_translated_offset
       = serde::from_iobuf<snapshot>(std::move(bytes)).highest_translated_offset;
-    co_return;
+    co_return raft::local_snapshot_applied::yes;
 }
 
 ss::future<raft::stm_snapshot>
@@ -138,7 +139,14 @@ translation_stm::take_local_snapshot(ssx::semaphore_units apply_units) {
     co_return raft::stm_snapshot::create(0, snapshot_offset, std::move(result));
 }
 
-ss::future<> translation_stm::apply_raft_snapshot(const iobuf&) { co_return; }
+ss::future<> translation_stm::apply_raft_snapshot(const iobuf&) {
+    // reset offset to not initalized when handling Raft snapshot, this way
+    // state machine will not hold any obsolete state that should be overriden
+    // with the snapshot.
+    vlog(_log.debug, "Applying raft snapshot, resetting state");
+    _highest_translated_offset = kafka::offset{};
+    co_return;
+}
 
 ss::future<iobuf> translation_stm::take_snapshot(model::offset) {
     co_return iobuf{};

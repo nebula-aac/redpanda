@@ -1,4 +1,4 @@
-load("//bazel:test.bzl", "redpanda_cc_btest", "redpanda_cc_gtest", "redpanda_test_cc_library")
+load("//bazel:test.bzl", "redpanda_cc_bench", "redpanda_cc_btest", "redpanda_cc_gtest", "redpanda_test_cc_library")
 
 redpanda_test_cc_library(
     name = "randoms",
@@ -6,6 +6,7 @@ redpanda_test_cc_library(
         "randoms.h",
     ],
     include_prefix = "cluster/tests",
+    visibility = ["//visibility:public"],
     deps = [
         "//src/v/cluster",
         "//src/v/model/tests:random",
@@ -58,7 +59,7 @@ redpanda_test_cc_library(
     include_prefix = "cluster/tests",
     deps = [
         "//src/v/cluster",
-        "//src/v/raft/tests:simple_raft_fixture_btest",
+        "//src/v/raft/tests:simple_raft_fixture",
     ],
 )
 
@@ -323,13 +324,17 @@ redpanda_cc_btest(
         "partition_allocator_tests.cc",
     ],
     deps = [
+        "//src/v/base",
         "//src/v/cluster",
+        "//src/v/cluster:topic_memory_per_partition_default",
         "//src/v/cluster/tests:partition_allocator_fixture",
+        "//src/v/config",
         "//src/v/model",
         "//src/v/raft",
         "//src/v/raft:fundamental",
         "//src/v/random:fast_prng",
         "//src/v/random:generators",
+        "//src/v/resource_mgmt:memory_groups",
         "//src/v/test_utils:seastar_boost",
         "@abseil-cpp//absl/container:flat_hash_set",
         "@boost//:test",
@@ -543,5 +548,65 @@ redpanda_cc_btest(
         "@boost//:test",
         "@fmt",
         "@seastar//:testing",
+    ],
+)
+
+redpanda_cc_bench(
+    name = "partition_allocator_b_rpbench",
+    srcs = ["allocation_bench.cc"],
+    deps = [
+        ":partition_allocator_fixture",
+        "//src/v/base",
+        "//src/v/cluster",
+        "//src/v/raft",
+        "@seastar",
+        "@seastar//:benchmark",
+    ],
+)
+
+redpanda_test_cc_library(
+    name = "health_monitor_test_utils",
+    hdrs = [
+        "health_monitor_test_utils.h",
+    ],
+    include_prefix = "cluster/tests",
+    deps = [
+        "//src/v/cluster",
+    ],
+)
+
+redpanda_cc_bench(
+    name = "health_report_rpbench",
+    srcs = ["health_bench.cc"],
+    deps = [
+        ":health_monitor_test_utils",
+        "//src/v/base",
+        "//src/v/cluster",
+        "//src/v/model",
+        "//src/v/raft",
+        "//src/v/random:generators",
+        "@seastar",
+        "@seastar//:benchmark",
+    ],
+)
+
+redpanda_cc_bench(
+    name = "leader_balancer_bench_rpbench",
+    srcs = ["leader_balancer_bench.cc"],
+    deps = [
+        ":leader_balancer_test_utils",
+        "//src/v/cluster",
+        "@seastar",
+        "@seastar//:benchmark",
+    ],
+)
+
+redpanda_cc_bench(
+    name = "health_monitor_rpbench",
+    srcs = ["health_monitor_bench.cc"],
+    deps = [
+        "//src/v/cluster",
+        "@seastar",
+        "@seastar//:benchmark",
     ],
 )

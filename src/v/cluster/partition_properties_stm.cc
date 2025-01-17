@@ -89,12 +89,13 @@ ss::future<iobuf> partition_properties_stm::take_snapshot(model::offset o) {
       raft_snapshot{.writes_disabled = it->writes_disabled});
 }
 
-ss::future<> partition_properties_stm::apply_local_snapshot(
+ss::future<raft::local_snapshot_applied>
+partition_properties_stm::apply_local_snapshot(
   raft::stm_snapshot_header header, iobuf&& buffer) {
     vlog(_log.debug, "Applying local snapshot with offset {}", header.offset);
     auto snapshot = serde::from_iobuf<local_snapshot>(std::move(buffer));
     _state_snapshots = std::move(snapshot.state_updates);
-    co_return;
+    co_return raft::local_snapshot_applied::yes;
 }
 
 ss::future<raft::stm_snapshot> partition_properties_stm::take_local_snapshot(
@@ -210,10 +211,7 @@ partition_properties_stm::replicate_properties_update(
       raft::consistency_level::quorum_ack,
       std::chrono::milliseconds(timeout / 1ms));
     r_opts.set_force_flush();
-    auto r = co_await _raft->replicate(
-      _insync_term,
-      model::make_memory_record_batch_reader(std::move(b)),
-      r_opts);
+    auto r = co_await _raft->replicate(_insync_term, std::move(b), r_opts);
 
     if (r.has_error()) {
         vlog(

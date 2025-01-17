@@ -1047,7 +1047,7 @@ FIXTURE_TEST(append_concurrent_with_prefix_truncate, storage_test_fixture) {
     auto ntp = model::controller_ntp;
 
     storage::ntp_config ntp_cfg(ntp, mgr.config().base_dir);
-    auto log = mgr.manage(std::move(ntp_cfg)).get0();
+    auto log = mgr.manage(std::move(ntp_cfg)).get();
 
     bool stop = false;
     size_t cnt = 0;
@@ -4061,7 +4061,7 @@ FIXTURE_TEST(test_skipping_compaction_below_start_offset, log_builder_fixture) {
     auto& first_seg = log.segments().front();
     BOOST_REQUIRE_EQUAL(first_seg->finished_self_compaction(), false);
 
-    b.apply_compaction(cfg.compact, *new_start_offset).get();
+    b.apply_adjacent_merge_compaction(cfg.compact, *new_start_offset).get();
 
     BOOST_REQUIRE_EQUAL(first_seg->finished_self_compaction(), false);
 

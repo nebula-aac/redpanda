@@ -111,18 +111,6 @@ acks_to_replicate_options(int16_t acks, std::chrono::milliseconds timeout) {
     };
 }
 
-static inline model::record_batch_reader
-reader_from_lcore_batch(model::record_batch&& batch) {
-    /*
-     * The remainder of work for this partition is handled on its home
-     * core. The foreign memory record batch reader requires that once the
-     * reader is sent to the foreign core that it has exclusive access to the
-     * data in reader. That is true here and is generally trivial with readers
-     * that hold a copy of their data in memory.
-     */
-    return model::make_foreign_memory_record_batch_reader(std::move(batch));
-}
-
 static error_code map_produce_error_code(std::error_code ec) {
     if (ec.category() == raft::error_category()) {
         switch (static_cast<raft::errc>(ec.value())) {
@@ -177,13 +165,13 @@ static partition_produce_stages partition_append(
   model::partition_id id,
   ss::lw_shared_ptr<replicated_partition> partition,
   model::batch_identity bid,
-  model::record_batch_reader reader,
+  std::unique_ptr<model::record_batch> batch,
   int16_t acks,
   int32_t num_records,
   int64_t num_bytes,
   std::chrono::milliseconds timeout_ms) {
     auto stages = partition->replicate(
-      bid, std::move(reader), acks_to_replicate_options(acks, timeout_ms));
+      bid, std::move(*batch), acks_to_replicate_options(acks, timeout_ms));
     return partition_produce_stages{
       .dispatched = std::move(stages.request_enqueued),
       .produced = stages.replicate_finished.then_wrapped(
@@ -328,7 +316,8 @@ static partition_produce_stages produce_topic_partition(
     }
 
     // steal the batch from the adapter
-    auto batch = std::move(part.records->adapter.batch.value());
+    auto batch = std::make_unique<model::record_batch>(
+      std::move(part.records->adapter.batch.value()));
 
     auto topic_cfg = octx.rctx.metadata_cache().get_topic_cfg(
       model::topic_namespace_view(model::kafka_namespace, topic.name));
@@ -347,16 +336,15 @@ static partition_produce_stages produce_topic_partition(
     // validate the batch timestamps by checking skew against broker time
     if (
       auto new_timestamp = validate_batch_timestamps(
-        ntp, batch.header(), timestamp_type, octx.rctx.server_probe())) {
-        batch.set_max_timestamp(
+        ntp, batch->header(), timestamp_type, octx.rctx.server_probe())) {
+        batch->set_max_timestamp(
           model::timestamp_type::append_time, new_timestamp.value());
     }
 
-    const auto& hdr = batch.header();
+    const auto& hdr = batch->header();
     auto bid = model::batch_identity::from(hdr);
-    auto batch_size = batch.size_bytes();
-    auto num_records = batch.record_count();
-    auto reader = reader_from_lcore_batch(std::move(batch));
+    auto batch_size = batch->size_bytes();
+    auto num_records = batch->record_count();
     auto validator
       = pandaproxy::schema_registry::maybe_make_schema_id_validator(
         octx.rctx.schema_registry(), topic.name, topic_cfg->properties);
@@ -377,7 +365,7 @@ static partition_produce_stages produce_topic_partition(
           .invoke_on(
             *shard,
             octx.ssg,
-            [reader = std::move(reader),
+            [batch = std::move(batch),
              validator = std::move(validator),
              ntp = std::move(ntp),
              dispatch = std::move(dispatch),
@@ -414,30 +402,30 @@ static partition_produce_stages produce_topic_partition(
                 }
 
                 auto probe = std::addressof(partition->probe());
-                return pandaproxy::schema_registry::maybe_validate_schema_id(
-                         std::move(validator), std::move(reader), probe)
-                  .then([ntp{std::move(ntp)},
-                         partition{std::move(partition)},
-                         dispatch = std::move(dispatch),
-                         bid,
-                         acks,
-                         source_shard,
-                         num_records,
-                         batch_size,
-                         timeout](auto reader) mutable {
-                      if (reader.has_error()) {
+                auto f = pandaproxy::schema_registry::maybe_validate_schema_id(
+                  std::move(validator), *batch, probe);
+
+                return std::move(f).then(
+                  [ntp{std::move(ntp)},
+                   partition{std::move(partition)},
+                   dispatch = std::move(dispatch),
+                   bid,
+                   acks,
+                   source_shard,
+                   num_records,
+                   batch_size,
+                   timeout,
+                   batch = std::move(batch)](kafka::error_code err) mutable {
+                      if (err != kafka::error_code::none) {
                           return finalize_request_with_error_code(
-                            reader.assume_error(),
-                            std::move(dispatch),
-                            ntp,
-                            source_shard);
+                            err, std::move(dispatch), ntp, source_shard);
                       }
                       auto stages = partition_append(
                         ntp.tp.partition,
                         ss::make_lw_shared<replicated_partition>(
                           std::move(partition)),
                         bid,
-                        std::move(reader).assume_value(),
+                        std::move(batch),
                         acks,
                         num_records,
                         batch_size,

@@ -29,8 +29,8 @@ namespace datalake {
 
 namespace {
 
-static std::unique_ptr<type_resolver>
-make_type_resolver(model::iceberg_mode mode, schema::registry& sr) {
+static std::unique_ptr<type_resolver> make_type_resolver(
+  model::iceberg_mode mode, schema::registry& sr, schema_cache& cache) {
     switch (mode) {
     case model::iceberg_mode::disabled:
         vassert(
@@ -39,7 +39,7 @@ make_type_resolver(model::iceberg_mode mode, schema::registry& sr) {
     case model::iceberg_mode::key_value:
         return std::make_unique<binary_type_resolver>();
     case model::iceberg_mode::value_schema_id_prefix:
-        return std::make_unique<record_schema_resolver>(sr);
+        return std::make_unique<record_schema_resolver>(sr, cache);
     }
 }
 
@@ -89,6 +89,11 @@ datalake_manager::datalake_manager(
   , _schema_registry(schema::registry::make_default(sr_api))
   , _catalog_factory(std::move(catalog_factory))
   , _type_resolver(std::make_unique<record_schema_resolver>(*_schema_registry))
+  // TODO: The cache size is currently arbitrary. Figure out a more reasoned
+  // size and allocate a share of the datalake memory semaphore to this cache.
+  , _schema_cache(std::make_unique<chunked_schema_cache>(
+      chunked_schema_cache::cache_t::config{
+        .cache_size = 50, .small_size = 10}))
   , _as(as)
   , _sg(sg)
   , _effective_max_translator_buffered_data(
@@ -126,9 +131,7 @@ ss::future<> datalake_manager::start() {
       = _partition_mgr->local().register_unmanage_notification(
         model::kafka_namespace, [this](model::topic_partition_view tp) {
             model::ntp ntp{model::kafka_namespace, tp.topic, tp.partition};
-            ssx::spawn_with_gate(_gate, [this, ntp = std::move(ntp)] {
-                return stop_translator(ntp);
-            });
+            stop_translator(ntp);
         });
     // Handle leadership changes
     auto leadership_registration
@@ -180,6 +183,7 @@ ss::future<> datalake_manager::start() {
             }
         });
     });
+    _schema_cache->start();
 }
 
 ss::future<> datalake_manager::stop() {
@@ -190,6 +194,7 @@ ss::future<> datalake_manager::stop() {
           return entry.second->stop();
       });
     co_await std::move(f);
+    _schema_cache->stop();
 }
 
 std::chrono::milliseconds datalake_manager::translation_interval_ms() const {
@@ -217,9 +222,7 @@ void datalake_manager::on_group_notification(const model::ntp& ntp) {
                             == model::iceberg_mode::disabled;
     if (!partition->is_leader() || iceberg_disabled) {
         if (it != _translators.end()) {
-            ssx::spawn_with_gate(_gate, [this, partition] {
-                return stop_translator(partition->ntp());
-            });
+            stop_translator(partition->ntp());
         }
         return;
     }
@@ -251,7 +254,7 @@ void datalake_manager::start_translator(
       _features,
       &_cloud_data_io,
       _schema_mgr.get(),
-      make_type_resolver(mode, *_schema_registry),
+      make_type_resolver(mode, *_schema_registry, *_schema_cache),
       make_record_translator(mode),
       translation_interval_ms(),
       _sg,
@@ -260,14 +263,23 @@ void datalake_manager::start_translator(
     _translators.emplace(partition->ntp(), std::move(translator));
 }
 
-ss::future<> datalake_manager::stop_translator(const model::ntp& ntp) {
+void datalake_manager::stop_translator(const model::ntp& ntp) {
+    if (_gate.is_closed()) {
+        // Cleanup should be deferred to stop().
+        return;
+    }
     auto it = _translators.find(ntp);
     if (it == _translators.end()) {
-        co_return;
+        return;
     }
-    auto translator = std::move(it->second);
+    auto t = std::move(it->second);
     _translators.erase(it);
-    co_await translator->stop();
+    ssx::spawn_with_gate(_gate, [t = std::move(t)]() mutable {
+        // Keep 't' alive by capturing it into the finally below. Use the raw
+        // pointer here to avoid a user-after-move.
+        auto* t_ptr = t.get();
+        return t_ptr->stop().finally([_ = std::move(t)] {});
+    });
 }
 
 } // namespace datalake
